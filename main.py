@@ -8,10 +8,22 @@ from sklearn.model_selection import train_test_split
 from torch import nn, optim
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error
+from scipy.stats import pearsonr
 from model import *
 import cv2
 from scipy import ndimage
+import random
+import os
+
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    
+setup_seed(2021)
 
 data_path = "./data/TCIR-ATLN_EPAC_WPAC.h5"
 data_info = pd.read_hdf(data_path, key="info", mode='r')
@@ -67,21 +79,76 @@ X_irpmw[X_irpmw > 1000] = 0
 # 对三通道数据进行平滑处理
 X_irpmw = smooth_three_channels(X_irpmw)
 
-# Test Train Split
-X_train, X_test, y_train, y_test = train_test_split(X_irpmw, y, test_size=0.1, random_state=42)
-# Define the input shape
-input_shape = (201, 201, 3)
+unique_storm_ids = data_info['ID'].unique()
 
-# 转换为Tensor
+# Handle Time column (lowercase in dataset) and Extract Year from ID
+if 'time' in data_info.columns:
+    # Format appears to be YYYYMMDDHH, e.g., 2017041606
+    data_info['Time'] = pd.to_datetime(data_info['time'].astype(str), format='%Y%m%d%H')
+else:
+    # Fallback if 'time' contains standard datetime objects or strings
+    data_info['Time'] = pd.to_datetime(data_info['time'])
+
+# Extract Year from ID (as requested by user, first 4 chars)
+# Assuming ID format like '201701L'
+data_info['Year'] = data_info['ID'].astype(str).str[:4].astype(int)
+
+# Sort storms strictly by Start Time
+storm_start_times = data_info.groupby('ID')['Time'].min()
+sorted_storm_ids = storm_start_times.sort_values().index.tolist()
+
+# Determine split indices for 8:1:1 (Train: 80%, Val: 10%, Test: 10%)
+n_storms = len(sorted_storm_ids)
+split_idx1 = int(n_storms * 0.8)
+split_idx2 = int(n_storms * 0.9)
+
+train_storm_ids = sorted_storm_ids[:split_idx1]
+val_storm_ids = sorted_storm_ids[split_idx1:split_idx2]
+test_storm_ids = sorted_storm_ids[split_idx2:]
+
+# Print split stats for verification
+# Using extracted Year from ID for verification as requested
+train_years = data_info[data_info['ID'].isin(train_storm_ids)]['Year']
+val_years = data_info[data_info['ID'].isin(val_storm_ids)]['Year']
+test_years = data_info[data_info['ID'].isin(test_storm_ids)]['Year']
+
+print(f"Training Data Years: {train_years.min()} - {train_years.max()} (Count: {len(train_storm_ids)})")
+print(f"Validation Data Years: {val_years.min()} - {val_years.max()} (Count: {len(val_storm_ids)})")
+print(f"Testing Data Years: {test_years.min()} - {test_years.max()} (Count: {len(test_storm_ids)})")
+
+train_mask = data_info['ID'].isin(train_storm_ids)
+val_mask = data_info['ID'].isin(val_storm_ids)
+test_mask = data_info['ID'].isin(test_storm_ids)
+
+X_train = X_irpmw[train_mask]
+y_train = y[train_mask]
+info_train = data_info[train_mask].reset_index(drop=True)
+
+X_val = X_irpmw[val_mask]
+y_val = y[val_mask]
+info_val = data_info[val_mask].reset_index(drop=True)
+
+X_test = X_irpmw[test_mask]
+y_test = y[test_mask]
+info_test = data_info[test_mask].reset_index(drop=True) # crucial for post-processing smoothing
+
+# Normalize inputs if needed (already handled by model/preprocessing usually, explicitly casting here)
 X_train = torch.tensor(X_train, dtype=torch.float32)
-X_test = torch.tensor(X_test, dtype=torch.float32)
 y_train = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+
+X_val = torch.tensor(X_val, dtype=torch.float32)
+y_val = torch.tensor(y_val, dtype=torch.float32).view(-1, 1)
+
+X_test = torch.tensor(X_test, dtype=torch.float32)
 y_test = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
 
 # 创建数据加载器
 train_dataset = TensorDataset(X_train, y_train)
+val_dataset = TensorDataset(X_val, y_val)
 test_dataset = TensorDataset(X_test, y_test)
+
 train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
 
 class RMSELoss(nn.Module):
@@ -96,7 +163,7 @@ class RMSELoss(nn.Module):
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 if __name__ == '__main__':
-    #稍加修改
+    #模型改进
     #model = ResNet18().to(device)
 
     #效果好renset-18
@@ -138,18 +205,20 @@ if __name__ == '__main__':
 
     # 训练模型
     num_epochs = 100
-    #这里要手动改第二次要改成上次的最小损失
-    best_test_loss = float('inf')
+    best_val_loss = float('inf') # Use Validation Loss for early stopping
     best_model_path = 'best_model.pth'
+    
+    # Try to load existing model
     try:
         model.load_state_dict(torch.load(best_model_path))
         print("Loaded best model from", best_model_path)
     except FileNotFoundError:
         print("No best model found, starting from scratch")
+
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        for inputs, targets in tqdm(train_loader):
+        for inputs, targets in tqdm(train_loader, desc=f"Epoch {epoch+1} Train"):
             inputs = inputs.permute(0, 3, 1, 2).to(device)
             targets = targets.to(device)
             optimizer.zero_grad()
@@ -158,33 +227,39 @@ if __name__ == '__main__':
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
-        print(f'Epoch [{epoch + 1}/{num_epochs}], Train Loss: {running_loss / len(train_loader):.4f}')
-        # 测试模型
+        
+        avg_train_loss = running_loss / len(train_loader)
+        print(f'Epoch [{epoch + 1}/{num_epochs}], Train Loss: {avg_train_loss:.4f}')
+        
+        # 验证模型 (Use Validation Set)
         model.eval()
         with torch.no_grad():
-            test_loss = 0.0
-            for inputs, targets in tqdm(test_loader):
+            val_loss = 0.0
+            for inputs, targets in tqdm(val_loader, desc=f"Epoch {epoch+1} Val"):
                 inputs = inputs.permute(0, 3, 1, 2).to(device)
                 targets = targets.to(device)
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
-                test_loss += loss.item()
-            print(f'Test Loss: {test_loss / len(test_loader):.4f}')
-            if (test_loss / len(test_loader)) < best_test_loss:
-                best_test_loss = test_loss / len(test_loader)
+                val_loss += loss.item()
+            
+            avg_val_loss = val_loss / len(val_loader)
+            print(f'Validation Loss: {avg_val_loss:.4f}')
+            
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
                 torch.save(model.state_dict(), best_model_path)
-                print(f'Best model saved with test loss: {best_test_loss}')
-        train_losses.append(running_loss / len(train_loader))
-        test_losses.append(test_loss / len(test_loader))
-    # 将损失写入文件
+                print(f'New Best Model saved with Val Loss: {best_val_loss:.4f}')
+                
+        train_losses.append(avg_train_loss)
+        test_losses.append(avg_val_loss) # Logging Val loss as "test_loss" for plot compatibility, or change variable name
     with open('DCNSESP_threechannel_losses.txt', 'w') as f:
         for epoch in range(num_epochs):
-            f.write(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_losses[epoch]:.4f}, Test Loss: {test_losses[epoch]:.4f}\n')
+            f.write(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_losses[epoch]:.4f}, Val Loss: {test_losses[epoch]:.4f}\n')
     # 绘制训练损失和测试损失的变化
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Training Loss')
-    plt.plot(test_losses, label='Testing Loss')
-    plt.title('Training and Testing Loss vs. Epoch')
+    # plt.plot(test_losses, label='Validation Loss') # Removed as requested
+    plt.title('Training Loss vs. Epoch')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
@@ -192,6 +267,13 @@ if __name__ == '__main__':
     # 在显示图表前保存到本地
     plt.savefig('DCNSESP_threechannel_loss_plot.png', format='png', dpi=300)
     plt.show()
+
+    print("Loading Best Model for Final Evaluation on Test Set...")
+    try:
+        model.load_state_dict(torch.load(best_model_path))
+        print("Best model loaded successfully.")
+    except FileNotFoundError:
+        print("Warning: Best model file not found, using last epoch model.")
 
     # 绘制真实值与预测值的散点图，并计算R值
     model.eval()
@@ -205,21 +287,27 @@ if __name__ == '__main__':
             all_preds.append(outputs.cpu().numpy())
             all_targets.append(targets.cpu().numpy())
 
-    all_preds = np.concatenate(all_preds)
-    all_targets = np.concatenate(all_targets)
+    all_preds = np.concatenate(all_preds).flatten()
+    all_targets = np.concatenate(all_targets).flatten()
 
-    # 计算RMSE和R
-    rmse = np.sqrt(mean_squared_error(all_targets, all_preds))
-    r2 = np.sqrt(r2_score(all_targets, all_preds))
+    info_test['Predicted'] = all_preds
+    info_test['Actual'] = all_targets
+    
+    # 计算RMSE和R (Pearson)
+    final_preds = all_preds
+    rmse = np.sqrt(mean_squared_error(all_targets, final_preds))
+    # Pearson Correlation
+    r_pearson, _ = pearsonr(all_targets, final_preds)
 
     # 绘制真实值与预测值的散点图
     plt.figure(figsize=(10, 6))
-    plt.scatter(all_targets, all_preds, alpha=0.5)
+    plt.scatter(all_targets, final_preds, alpha=0.5)
     plt.xlabel('True Intensity')
-    plt.ylabel('Predicted Intensity')
-    plt.title(f'True vs Predicted Intensity\nRMSE: {rmse:.4f}, R: {r2:.4f}')
+    plt.ylabel('Predicted Intensity (Smoothed)')
+    plt.title(f'True vs Predicted Intensity\nRMSE: {rmse:.4f}, Pearson R: {r_pearson:.4f}')
     plt.grid(True)
-    plt.savefig('DCNSESP_threechannel_true_vs_predicted.png', format='png', dpi=300)
+    plt.savefig('DCNSESP_threechannel_true_vs_predicted_smoothed.png', format='png', dpi=300)
     plt.show()
 
-    print(f'R: {r2:.4f}')
+    print(f'RMSE: {rmse:.4f}')
+    print(f'Pearson R: {r_pearson:.4f}')
